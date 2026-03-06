@@ -552,6 +552,197 @@ def convert_lanhu_to_html(json_data: dict) -> str:
     return html
 
 
+def _extract_design_tokens(sketch_data: dict) -> str:
+    """
+    从 Sketch JSON 中提取高风险元素的设计参数，输出紧凑文本供 AI 校验。
+    只提取含渐变、非均匀圆角、边框、阴影的**真实可见**元素，过滤掉 Sketch 内部节点。
+    """
+    import math
+
+    NOISE_TYPES = {'color', 'gradient', 'colorStop', 'colorControl'}
+
+    def _get_dimensions(obj: dict) -> tuple:
+        """获取元素实际尺寸，优先从 frame 字段读取"""
+        frame = obj.get('ddsOriginFrame') or obj.get('layerOriginFrame') or {}
+        x = frame.get('x', obj.get('left', 0)) or 0
+        y = frame.get('y', obj.get('top', 0)) or 0
+        w = frame.get('width', obj.get('width', 0)) or 0
+        h = frame.get('height', obj.get('height', 0)) or 0
+        return x, y, w, h
+
+    def _simplify_fill(fill: dict) -> str | None:
+        if not fill.get('isEnabled', True):
+            return None
+        fill_type = fill.get('fillType', 0)
+        if fill_type == 0:
+            color = fill.get('color', {})
+            return f"solid({color.get('value', 'unknown')})"
+        if fill_type == 1:
+            gradient = fill.get('gradient', {})
+            stops = gradient.get('colorStops', [])
+            from_pt = gradient.get('from', {})
+            to_pt = gradient.get('to', {})
+            dx = to_pt.get('x', 0.5) - from_pt.get('x', 0.5)
+            dy = to_pt.get('y', 0) - from_pt.get('y', 0)
+            angle = round(math.degrees(math.atan2(dx, dy))) % 360
+            parts = []
+            for s in stops:
+                c = s.get('color', {}).get('value', 'unknown')
+                p = s.get('position', 0)
+                parts.append(f"{c} {round(p * 100)}%")
+            return f"linear-gradient({angle}deg, {', '.join(parts)})"
+        return None
+
+    def _simplify_border(border: dict) -> str | None:
+        if not border.get('isEnabled', True):
+            return None
+        color = border.get('color', {}).get('value', 'unknown')
+        thickness = border.get('thickness', 1)
+        pos_map = {'内边框': 'inside', '外边框': 'outside', '中心边框': 'center'}
+        pos = pos_map.get(border.get('position', ''), border.get('position', 'center'))
+        return f"{thickness}px {pos} {color}"
+
+    def _simplify_shadow(shadow: dict) -> str | None:
+        if not shadow.get('isEnabled', True):
+            return None
+        color = shadow.get('color', {}).get('value', 'unknown')
+        x = shadow.get('offsetX', 0)
+        y = shadow.get('offsetY', 0)
+        blur = shadow.get('blurRadius', 0)
+        spread = shadow.get('spread', 0)
+        return f"{color} {x}px {y}px {blur}px {spread}px"
+
+    def _has_only_transparent_solid(fills: list) -> bool:
+        """判断 fills 是否只有透明纯色填充（无视觉意义）"""
+        for f in fills:
+            if not f.get('isEnabled', True):
+                continue
+            if f.get('fillType', 0) == 0:
+                color = f.get('color', {})
+                val = color.get('value', '')
+                if 'rgba' in val and ',0)' in val.replace(' ', ''):
+                    continue
+                alpha = color.get('alpha', color.get('a', 1))
+                if alpha == 0:
+                    continue
+            return False
+        return True
+
+    def _is_high_risk(obj: dict) -> bool:
+        obj_type = (obj.get('type') or obj.get('ddsType') or '').lower()
+        if obj_type in NOISE_TYPES:
+            return False
+
+        _, _, w, h = _get_dimensions(obj)
+        if w < 2 and h < 2:
+            return False
+
+        has_gradient_fill = False
+        fills = obj.get('fills', [])
+        for f in fills:
+            if f.get('isEnabled', True) and f.get('fillType') == 1:
+                has_gradient_fill = True
+                break
+        if has_gradient_fill:
+            return True
+
+        if obj.get('borders'):
+            for b in obj['borders']:
+                if b.get('isEnabled', True):
+                    return True
+
+        radius = obj.get('radius')
+        if isinstance(radius, list) and len(set(radius)) > 1:
+            return True
+
+        opacity = obj.get('opacity')
+        if opacity is not None and opacity < 100:
+            if _has_only_transparent_solid(fills) and not obj.get('borders') and not obj.get('shadows'):
+                return False
+            return True
+
+        if obj.get('shadows'):
+            for s in obj['shadows']:
+                if s.get('isEnabled', True):
+                    return True
+
+        return False
+
+    tokens = []
+
+    def _build_path(parent_path: str, name: str) -> str:
+        return f"{parent_path}/{name}" if parent_path else name
+
+    def _walk(obj: dict, parent_path: str = ""):
+        if not obj or not isinstance(obj, dict):
+            return
+        if not obj.get('isVisible', True):
+            return
+
+        name = obj.get('name', '')
+        current_path = _build_path(parent_path, name)
+
+        if _is_high_risk(obj):
+            obj_type = obj.get('type') or obj.get('ddsType') or 'unknown'
+            x, y, w, h = _get_dimensions(obj)
+
+            lines = [f'[{obj_type}] "{name}" @({int(x)},{int(y)}) {int(w)}x{int(h)}']
+            if parent_path:
+                lines[0] += f'  path: {current_path}'
+
+            radius = obj.get('radius')
+            if radius:
+                if isinstance(radius, list):
+                    if len(set(radius)) == 1:
+                        lines.append(f'  radius: {radius[0]}')
+                    else:
+                        lines.append(f'  radius: {radius}')
+                else:
+                    lines.append(f'  radius: {radius}')
+
+            for f in obj.get('fills', []):
+                s = _simplify_fill(f)
+                if s:
+                    lines.append(f'  fill: {s}')
+
+            for b in obj.get('borders', []):
+                s = _simplify_border(b)
+                if s:
+                    lines.append(f'  border: {s}')
+
+            opacity = obj.get('opacity')
+            if opacity is not None and opacity < 100:
+                lines.append(f'  opacity: {opacity}%')
+
+            for sh in obj.get('shadows', []):
+                s = _simplify_shadow(sh)
+                if s:
+                    lines.append(f'  shadow: {s}')
+
+            tokens.append('\n'.join(lines))
+
+        for child in obj.get('layers', []):
+            _walk(child, current_path)
+
+    if sketch_data.get('artboard') and sketch_data['artboard'].get('layers'):
+        for layer in sketch_data['artboard']['layers']:
+            _walk(layer)
+    elif sketch_data.get('info'):
+        for item in sketch_data['info']:
+            _walk(item)
+            for value in item.values():
+                if isinstance(value, dict):
+                    _walk(value)
+                elif isinstance(value, list):
+                    for v in value:
+                        if isinstance(v, dict):
+                            _walk(v)
+
+    if not tokens:
+        return ""
+    return '\n\n'.join(tokens)
+
+
 def _minify_css(css: str) -> str:
     """压缩 CSS：去掉注释、折叠空白。"""
     css = re.sub(r'/\*[\s\S]*?\*/', '', css)
@@ -578,6 +769,51 @@ def minify_html(html: str) -> str:
         remove_comments=True,
         remove_empty_space=True,
     )
+
+
+def _localize_image_urls(html_code: str, design_name: str) -> tuple[str, dict]:
+    """
+    将生成的 HTML 中的远程图片 URL 替换为本地路径占位符，并返回下载映射表。
+    处理 <img src="..."> 和 CSS url(...) 中的远程地址。
+    """
+    url_mapping = {}
+    counter = [0]
+
+    def _make_local_name(remote_url: str) -> str:
+        parsed = urlparse(remote_url)
+        path = parsed.path
+        ext = '.png'
+        if '.' in path.split('/')[-1]:
+            ext = '.' + path.split('/')[-1].rsplit('.', 1)[-1]
+            if ext not in ('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'):
+                ext = '.png'
+        counter[0] += 1
+        return f"img_{counter[0]}{ext}"
+
+    def _replace_img_src(match):
+        url = match.group(1)
+        if not url or not url.startswith('http'):
+            return match.group(0)
+        local_name = _make_local_name(url)
+        local_path = f"./assets/slices/{local_name}"
+        url_mapping[local_path] = url
+        return f'src="{local_path}"'
+
+    def _replace_css_url(match):
+        url = match.group(1).strip('\'"')
+        if not url or not url.startswith('http'):
+            return match.group(0)
+        local_name = _make_local_name(url)
+        local_path = f"./assets/slices/{local_name}"
+        url_mapping[local_path] = url
+        return f"url('{local_path}')"
+
+    result = re.sub(r'src="(https?://[^"]*)"', _replace_img_src, html_code)
+    result = re.sub(r"src='(https?://[^']*)'", _replace_img_src, result)
+    result = re.sub(r'src=(https?://[^\s>\'\"]+)', _replace_img_src, result)
+    result = re.sub(r'url\(([\'"]*https?://[^\)]*)\)', _replace_css_url, result)
+
+    return result, url_mapping
 
 
 # ==================== 转换器结束 ====================
@@ -2090,9 +2326,94 @@ class LanhuExtractor:
         version_id = await self._get_version_id_by_image_id(project_id, team_id, image_id)
         return await self._fetch_dds_schema(version_id)
 
+    async def get_sketch_json(self, image_id: str, team_id: str, project_id: str) -> dict:
+        """获取原始 Sketch JSON（含完整设计标注数据，用于 design token 提取）"""
+        url = f"{BASE_URL}/api/project/image"
+        params = {
+            "dds_status": 1,
+            "image_id": image_id,
+            "team_id": team_id,
+            "project_id": project_id
+        }
+        response = await self.client.get(url, params=params)
+        data = response.json()
+        if data['code'] != '00000':
+            raise Exception(f"Failed to get design: {data['msg']}")
+        result = data['result']
+        latest_version = result['versions'][0]
+        json_url = latest_version['json_url']
+        json_response = await self.client.get(json_url)
+        return json_response.json()
+
     async def close(self):
         """关闭客户端"""
         await self.client.aclose()
+
+
+def _format_page_design_info(design_info: dict, resource_dir: str = "") -> str:
+    """
+    将页面设计样式信息格式化为可读文本，供 AI 在生成代码时参考。
+    包含文字颜色、背景色、字体规格、页面图片资源。
+    """
+    if not design_info:
+        return ""
+
+    lines = ["[设计样式参考 - 用于生成代码时匹配原型视觉效果]"]
+
+    # 文字颜色
+    text_colors = design_info.get('textColors', [])
+    if text_colors:
+        lines.append("  文字颜色 (按使用频率):")
+        for color_val, count in text_colors:
+            lines.append(f"    {color_val} (x{count})")
+
+    # 背景颜色
+    bg_colors = design_info.get('bgColors', [])
+    if bg_colors:
+        lines.append("  背景颜色:")
+        for color_val, count in bg_colors:
+            lines.append(f"    {color_val} (x{count})")
+
+    # 字体规格 (fontSize|fontWeight|color -> count)
+    font_specs = design_info.get('fontSpecs', [])
+    if font_specs:
+        lines.append("  字体规格 (字号/字重/颜色):")
+        for spec_key, count in font_specs:
+            parts = spec_key.split('|')
+            if len(parts) == 3:
+                lines.append(f"    {parts[0]} / {parts[1]} / {parts[2]} (x{count})")
+            else:
+                lines.append(f"    {spec_key} (x{count})")
+
+    # 页面图片资源
+    images = design_info.get('images', [])
+    if images:
+        lines.append("  页面图片资源 (切图):")
+        seen = set()
+        for img in images:
+            src = img.get('src', '')
+            if not src or src in seen:
+                continue
+            seen.add(src)
+            # localhost URL 转为相对路径
+            if 'localhost' in src or '127.0.0.1' in src:
+                parsed = urlparse(src)
+                src = parsed.path.lstrip('/')
+            w = img.get('w', '?')
+            h = img.get('h', '?')
+            img_type = img.get('type', 'img')
+            label = "背景图" if img_type == 'bg' else "图片"
+            local_note = ""
+            if resource_dir:
+                local_file = Path(resource_dir) / src
+                if local_file.exists():
+                    local_note = f" [本地: {local_file}]"
+            lines.append(f"    [{label}] {src} ({w}x{h}){local_note}")
+
+    if len(lines) <= 1:
+        return ""
+
+    return "\n".join(lines)
 
 
 def fix_html_files(directory: str):
@@ -2183,6 +2504,7 @@ async def screenshot_page_internal(resource_dir: str, page_names: List[str], out
         safe_name = re.sub(r'[^\w\s-]', '_', page_name)
         screenshot_file = output_path / f"{safe_name}.png"
         text_file = output_path / f"{safe_name}.txt"
+        styles_file = output_path / f"{safe_name}_styles.json"
         
         # 如果版本相同且文件存在，复用缓存
         if (version_id and cached_version == version_id and 
@@ -2195,11 +2517,21 @@ async def screenshot_page_internal(resource_dir: str, page_names: List[str], out
                 except Exception:
                     page_text = "(Cached - text not available)"
             
+            # 读取缓存的样式信息
+            page_design_info = None
+            if styles_file.exists():
+                try:
+                    with open(styles_file, 'r', encoding='utf-8') as sf:
+                        page_design_info = json.load(sf)
+                except Exception:
+                    pass
+            
             cached_results.append({
                 'page_name': page_name,
                 'success': True,
                 'screenshot_path': str(screenshot_file),
                 'page_text': page_text if page_text else "(Cached result)",
+                'page_design_info': page_design_info,
                 'size': f"{screenshot_file.stat().st_size / 1024:.1f}KB",
                 'from_cache': True
             })
@@ -2307,10 +2639,69 @@ async def screenshot_page_internal(resource_dir: str, page_names: List[str], out
                     return sections.join("\\n\\n");
                 }''')
 
+                # 提取页面设计样式信息（字体颜色、背景色、图片资源等）
+                page_design_info = await page.evaluate('''() => {
+                    const allEls = document.querySelectorAll('*');
+                    const textColors = {};
+                    const bgColors = {};
+                    const fontSpecs = {};
+                    const images = [];
+
+                    allEls.forEach(el => {
+                        const cs = window.getComputedStyle(el);
+                        if (cs.display === 'none' || cs.visibility === 'hidden') return;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 1 || rect.height < 1) return;
+
+                        // 收集直接包含文本的元素样式
+                        const hasDirectText = Array.from(el.childNodes).some(
+                            n => n.nodeType === 3 && n.textContent.trim().length > 0
+                        );
+                        if (hasDirectText) {
+                            const color = cs.color;
+                            if (color) textColors[color] = (textColors[color] || 0) + 1;
+                            const key = cs.fontSize + '|' + cs.fontWeight + '|' + color;
+                            fontSpecs[key] = (fontSpecs[key] || 0) + 1;
+                        }
+
+                        // 收集背景色
+                        const bg = cs.backgroundColor;
+                        if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
+                            bgColors[bg] = (bgColors[bg] || 0) + 1;
+                        }
+
+                        // 收集背景图片
+                        const bgImg = cs.backgroundImage;
+                        if (bgImg && bgImg !== 'none') {
+                            const m = bgImg.match(/url\\("?([^"\\)]*)"?\\)/);
+                            if (m && !m[1].startsWith('data:')) {
+                                images.push({ src: m[1], type: 'bg', w: Math.round(rect.width), h: Math.round(rect.height) });
+                            }
+                        }
+                    });
+
+                    // 收集 <img> 元素
+                    document.querySelectorAll('img').forEach(img => {
+                        if (img.src && img.naturalWidth > 0 && !img.src.startsWith('data:')) {
+                            images.push({ src: img.src, type: 'img', w: img.naturalWidth, h: img.naturalHeight });
+                        }
+                    });
+
+                    // 按使用频率排序
+                    const sortObj = o => Object.entries(o).sort((a, b) => b[1] - a[1]);
+                    return {
+                        textColors: sortObj(textColors).slice(0, 15),
+                        bgColors: sortObj(bgColors).slice(0, 10),
+                        fontSpecs: sortObj(fontSpecs).slice(0, 15),
+                        images: images.slice(0, 30)
+                    };
+                }''')
+
                 # 截图
                 safe_name = re.sub(r'[^\w\s-]', '_', page_name)
                 screenshot_path = output_path / f"{safe_name}.png"
                 text_path = output_path / f"{safe_name}.txt"
+                styles_path = output_path / f"{safe_name}_styles.json"
 
                 # 获取截图字节
                 screenshot_bytes = await page.screenshot(full_page=True)
@@ -2324,11 +2715,19 @@ async def screenshot_page_internal(resource_dir: str, page_names: List[str], out
                 except Exception:
                     pass
 
+                # 保存样式信息到文件（用于缓存）
+                try:
+                    with open(styles_path, 'w', encoding='utf-8') as sf:
+                        json.dump(page_design_info, sf, ensure_ascii=False)
+                except Exception:
+                    pass
+
                 result = {
                     'page_name': page_name,
                     'success': True,
                     'screenshot_path': str(screenshot_path),
                     'page_text': page_text,
+                    'page_design_info': page_design_info,
                     'size': f"{len(screenshot_bytes) / 1024:.1f}KB",
                     'from_cache': False
                 }
@@ -3179,7 +3578,14 @@ async def lanhu_get_ai_analyze_page_result(
     
     Returns:
         - mode="text_only": Text content only (for fast global scan)
-        - mode="full": Visual + text (format determined by analysis_mode)
+        - mode="full": Visual + text + design style info (format determined by analysis_mode)
+          Each page includes [设计样式参考] with:
+            - 文字颜色: exact text colors used (rgba/rgb values, sorted by frequency)
+            - 背景颜色: exact background colors used
+            - 字体规格: font-size / font-weight / color combinations
+            - 页面图片资源: all images used on the page with dimensions and local paths
+          When generating code, you MUST use these exact color/font/size values from
+          [设计样式参考] instead of guessing. For images, use the local file paths provided.
     """
     extractor = LanhuExtractor()
 
@@ -3297,10 +3703,13 @@ async def lanhu_get_ai_analyze_page_result(
             header_text += f"🤖 STAGE 2 分析模式：【{mode_prompts['mode_name']}】\n"
             header_text += f"📋 {mode_prompts['mode_desc']}\n"
             header_text += "=" * 60 + "\n"
-            header_text += "📸 理解原则：视觉输出为主，文本为辅\n"
+            header_text += "📸 理解原则：视觉输出为主，文本为辅，样式数据为准\n"
             header_text += "  • 视觉输出包含完整UI、流程图、交互细节\n"
             header_text += "  • 文本提供关键信息提取但可能不完整\n"
-            header_text += "  • 建议：先看图理解整体，再用文本快速定位关键点\n\n"
+            header_text += "  • 建议：先看图理解整体，再用文本快速定位关键点\n"
+            header_text += "  • 每页附带 [设计样式参考]，包含精确的颜色值、字体规格、图片资源\n"
+            header_text += "  • 生成代码时必须使用 [设计样式参考] 中的精确值，禁止凭空编造颜色/字号\n"
+            header_text += "  • 页面图片资源已标注本地路径，生成代码时直接引用本地文件\n\n"
             
             # 添加当前分析模式的 Stage 2 prompt
             header_text += "=" * 60 + "\n"
@@ -3403,6 +3812,12 @@ async def lanhu_get_ai_analyze_page_result(
                 page_text += r['page_text'] + "\n"
             else:
                 page_text += "⚠️ No text content extracted (please refer to corresponding visual output above)\n"
+
+            # FULL模式下附加设计样式信息，供 AI 生成代码时精确匹配原型
+            if not is_text_only and r.get('page_design_info'):
+                style_text = _format_page_design_info(r['page_design_info'], resource_dir)
+                if style_text:
+                    page_text += f"\n{style_text}\n"
 
             content.append(page_text)
 
@@ -3532,6 +3947,85 @@ async def lanhu_get_ai_analyze_design_result(
         Visual representation of UI design images AND HTML+CSS code for each design.
         First block: summary text with "设计图 1/2/3..." and each design's HTML code.
         Following blocks: images in the same order as 设计图 1, 2, 3... (image N = design N).
+        
+    CRITICAL - How to use the returned HTML+CSS (MUST follow this workflow):
+
+        ⚠️ AUTHORITY PRIORITY (highest → lowest):
+            1. HTML+CSS code  — the PRIMARY source of truth for all visual parameters
+            2. Design Tokens  — supplementary reference for gradients/borders/shadows
+            3. Design Image   — visual verification ONLY, never override CSS values
+
+        The returned HTML+CSS is the DESIGN SPECIFICATION generated from design schema.
+        Every CSS property value (color, size, spacing, font, gradient, border-radius,
+        etc.) is extracted from the original design data and MUST be used as-is.
+
+        RULE 1 - HTML+CSS IS DESIGN SPEC, COPY CSS VALUES DIRECTLY:
+            The CSS values are the single source of truth for all design parameters.
+            You MUST directly copy/reuse the exact CSS property values from the code.
+            DO NOT modify, simplify, or "improve" any CSS value. Specifically:
+              - DO NOT change rgba() to hex or vice versa (keep rgba(255,115,10,1) as-is)
+              - DO NOT round or simplify numbers (keep 0.30000001192092896 as-is)
+              - DO NOT replace linear-gradient with solid colors
+              - DO NOT change font-family order or remove fallback fonts
+              - DO NOT adjust margin/padding values for "cleaner" numbers
+              - DO NOT replace any img src or background-url with SVG, CSS shapes, or emoji
+              - DO NOT omit any visual element from the design
+            The HTML DOM structure and class names indicate layout intent (flex-row=Row,
+            flex-col=Column, justify-between=SpaceBetween, etc.), adapt them to the
+            target framework's component model while keeping all CSS values unchanged.
+
+        RULE 2 - DETECT USER PROJECT AND GENERATE FRAMEWORK-APPROPRIATE CODE:
+            STEP 1: Read project config files (package.json, tsconfig.json, pubspec.yaml,
+                    build.gradle, Podfile, etc.) to detect framework and styling approach.
+            STEP 2: Generate code matching the detected framework:
+              - React/Next.js  → JSX component + CSS Modules / styled-components / Tailwind
+              - Vue/Nuxt       → Single File Component (.vue) with <style scoped>
+              - Angular        → component.ts + component.html + component.css
+              - Svelte         → Component.svelte with <style>
+              - Flutter        → StatelessWidget with EdgeInsets, BoxDecoration, etc.
+              - SwiftUI        → View struct with ViewModifier
+              - Android Compose→ @Composable function with Modifier
+              - Plain HTML     → Single self-contained .html file with inline <style>
+            STEP 3: Follow the project's existing conventions (file naming, directory
+                    structure, styling approach). If no framework detected, default to
+                    plain HTML single file.
+            CSS-to-platform property mapping reference:
+              width/height px    → Android: dp, iOS: pt, Flutter: logical pixels
+              font-size px       → Android: sp, iOS: pt, Flutter: fontSize
+              margin/padding     → Keep proportions, convert px to dp/pt
+              border-radius      → Android: dp, iOS: cornerRadius, Flutter: BorderRadius
+              color rgba()       → Android: Color.argb(), iOS: UIColor, Flutter: Color
+              linear-gradient    → Android: GradientDrawable, iOS: CAGradientLayer
+              flex-row / flex-col→ Row/Column (Flutter), HStack/VStack (SwiftUI)
+              position:absolute  → Stack+Positioned (Flutter), ZStack (SwiftUI)
+
+        RULE 3 - IMAGE ASSETS USE LOCAL PATHS (MANDATORY):
+            The returned HTML+CSS already uses LOCAL paths (./assets/slices/xxx.png)
+            for all image resources. A download mapping table is provided below each
+            design's HTML code, listing: local_path ← remote_download_url.
+            You MUST:
+              1. Download ALL images from the mapping table to the project's local
+                 assets directory BEFORE generating final code.
+              2. Keep using local paths in the generated code. Adapt paths to the
+                 target framework convention:
+                   React/Vue   → import coverImg from '@/assets/slices/cover.png'
+                   Flutter     → AssetImage('assets/images/cover.png')
+                   Plain HTML  → <img src="./assets/slices/cover.png">
+              3. NEVER use remote lanhu CDN URLs in any generated code.
+            Additionally, call lanhu_get_design_slices(url, design_name) to get the
+            full slice list for more fine-grained assets (icons, background images, etc.).
+
+        RULE 4 - CROSS-REFERENCE DESIGN TOKENS (SUPPLEMENTARY ONLY):
+            Design Tokens (if present) are extracted from the raw Sketch data.
+            They serve as SUPPLEMENTARY reference for properties that HTML+CSS may
+            not fully express (e.g. complex gradients, multi-stop fills, shadows).
+            Use Design Tokens to ENRICH the code, not to override HTML+CSS values.
+            Only when a CSS property is clearly MISSING (not just different) from the
+            HTML+CSS, use the Design Token value as a supplement.
+            Focus on: gradients, border styles, border-radius, opacity, shadows.
+
+        DESIGN IMAGE is for visual verification ONLY. It has the LOWEST priority.
+        NEVER use the design image to override any CSS value from the HTML+CSS code.
     """
     extractor = LanhuExtractor()
     try:
@@ -3632,6 +4126,9 @@ async def lanhu_get_ai_analyze_design_result(
                 # 转换为 HTML 并压缩（与 TS 端一致，减少 token）
                 html_code = minify_html(convert_lanhu_to_html(schema_json))
                 
+                # 远程图片 URL 替换为本地路径，生成下载映射表
+                html_code, image_url_mapping = _localize_image_urls(html_code, design['name'])
+                
                 # 保存HTML文件
                 html_filename = f"{design['name']}.html"
                 html_filepath = output_dir / html_filename
@@ -3644,6 +4141,7 @@ async def lanhu_get_ai_analyze_design_result(
                     'design_name': design['name'],
                     'html_path': str(html_filepath),
                     'html_code': html_code,
+                    'image_url_mapping': image_url_mapping,
                 })
             except Exception as e:
                 html_results.append({
@@ -3651,6 +4149,22 @@ async def lanhu_get_ai_analyze_design_result(
                     'design_name': design['name'],
                     'error': str(e)
                 })
+
+            # ===== 3. 获取 Sketch JSON 并提取 Design Tokens =====
+            try:
+                sketch_json = await extractor.get_sketch_json(
+                    design['id'],
+                    params['team_id'],
+                    params['project_id']
+                )
+                design_tokens = _extract_design_tokens(sketch_json)
+                if design_tokens:
+                    for hr in html_results:
+                        if hr.get('design_name') == design['name'] and hr.get('success'):
+                            hr['design_tokens'] = design_tokens
+                            break
+            except Exception:
+                pass
 
         # Build return content
         content = []
@@ -3663,7 +4177,60 @@ async def lanhu_get_ai_analyze_design_result(
 
         # Show design list with both image and HTML info（每条加显式标题便于多图时对应）
         summary_text += "📋 Design List (display order from top to bottom):\n"
-        summary_text += "下方图片顺序与列表中「设计图 1」「设计图 2」… 一一对应，请按序号关联图片与代码。\n"
+        summary_text += "下方图片顺序与列表中「设计图 1」「设计图 2」… 一一对应，请按序号关联图片与代码。\n\n"
+        summary_text += "🚨 CRITICAL: 设计稿代码使用流程（必须按顺序执行）\n"
+        summary_text += "以下 HTML+CSS 是从设计稿 Schema 生成的【设计规格书】，是所有设计参数的权威来源。\n"
+        summary_text += "⚠️ 权威优先级: HTML+CSS 代码 > Design Tokens 标注 > 设计图图片\n"
+        summary_text += "⚠️ 核心原则: 直接复用 CSS 属性值，禁止修改/简化/美化任何 CSS 值\n\n"
+        summary_text += "STEP 1 - 探测用户项目环境：\n"
+        summary_text += "  读取项目配置文件（package.json / tsconfig.json / pubspec.yaml / build.gradle / Podfile 等）\n"
+        summary_text += "  识别框架: React/Vue/Angular/Svelte/Flutter/SwiftUI/Compose/纯HTML\n"
+        summary_text += "  识别样式方案: CSS Modules / Tailwind / SCSS / Styled Components / scoped style 等\n"
+        summary_text += "  识别项目目录结构和命名规范\n"
+        summary_text += "  如无法判断框架，默认输出纯 HTML 单文件\n\n"
+        summary_text += "STEP 2 - 下载图片资源到本地（必须在生成代码前完成）：\n"
+        summary_text += "  下方每个设计图的 HTML 代码中，图片已替换为本地路径（./assets/slices/xxx.png）\n"
+        summary_text += "  每个设计图下方附有「图片资源下载映射」，列出 本地路径 ← 远程下载地址\n"
+        summary_text += "  必须按映射表下载所有图片到项目本地 assets 目录：\n"
+        summary_text += "    macOS/Linux → curl -o <path> \"<url>\"\n"
+        summary_text += "    Windows → PowerShell Invoke-WebRequest -Uri \"<url>\" -OutFile <path>\n"
+        summary_text += "  如需更多切图（图标、背景等），调用 lanhu_get_design_slices(url, design_name)\n\n"
+        summary_text += "STEP 3 - 生成框架适配代码（直接复用 CSS 值，禁止修改）：\n"
+        summary_text += "  从下方 HTML+CSS 直接复制所有 CSS 属性值（颜色/字号/间距/圆角/渐变等）\n"
+        summary_text += "  ⚠️ 必须原样使用 CSS 值，禁止做任何修改：\n"
+        summary_text += "    - rgba(255,115,10,1) 不要改成 #FF730A\n"
+        summary_text += "    - linear-gradient 不要简化成纯色\n"
+        summary_text += "    - margin/padding 数值不要四舍五入\n"
+        summary_text += "    - font-family 不要删减或重排\n"
+        summary_text += "  按目标框架生成组件代码：\n"
+        summary_text += "    React/Next.js  → JSX + CSS Modules 或跟随项目已有方案\n"
+        summary_text += "    Vue/Nuxt       → .vue SFC + <style scoped>\n"
+        summary_text += "    Angular        → .ts + .html + .css\n"
+        summary_text += "    Flutter        → Widget + EdgeInsets/BoxDecoration，px→逻辑像素\n"
+        summary_text += "    SwiftUI        → View + ViewModifier，px→pt\n"
+        summary_text += "    Android Compose → @Composable + Modifier，px→dp，font px→sp\n"
+        summary_text += "    纯 HTML         → 单个 .html 文件，内联 <style>（含 common.css 工具类）\n"
+        summary_text += "  图片路径按框架约定适配（代码中已是本地路径，只需调整路径格式）：\n"
+        summary_text += "    React/Vue → import img from '@/assets/slices/xxx.png'\n"
+        summary_text += "    Flutter   → AssetImage('assets/images/xxx.png')\n"
+        summary_text += "    纯 HTML   → <img src=\"./assets/slices/xxx.png\">（已就绪）\n\n"
+        summary_text += "STEP 4 - 对照 Design Tokens 补充校验（如下方包含 Design Tokens）：\n"
+        summary_text += "  Design Tokens 来自原始 Sketch 设计数据，作为补充参考。\n"
+        summary_text += "  优先级: HTML+CSS > Design Tokens > 设计图\n"
+        summary_text += "  仅当 HTML+CSS 中明显缺失某属性时，用 Design Token 补充：\n"
+        summary_text += "    如渐变填充、复杂阴影、多边圆角等 CSS 未能完整表达的属性\n"
+        summary_text += "  Design Token 不能覆盖 HTML+CSS 中已有的值。\n\n"
+        summary_text += "❌ 严禁行为：\n"
+        summary_text += "  - 禁止修改 CSS 属性值（不要改颜色格式、不要简化渐变、不要调整数值）\n"
+        summary_text += "  - 禁止凭空编造设计参数（颜色、尺寸、间距等必须来自下方 CSS）\n"
+        summary_text += "  - 禁止用设计图的视觉感受覆盖 CSS 中的精确值\n"
+        summary_text += "  - 禁止用 SVG/CSS 形状/emoji 替换切图资源\n"
+        summary_text += "  - 禁止省略任何视觉元素\n"
+        summary_text += "  - 禁止在最终代码中使用蓝湖远程 URL\n\n"
+        summary_text += "📐 common.css 工具类含义（用于理解布局意图）：\n"
+        summary_text += "  flex-col = Column 方向布局    flex-row = Row 方向布局\n"
+        summary_text += "  justify-between/center/start/end/around/evenly = 主轴对齐\n"
+        summary_text += "  align-start/center/end = 交叉轴对齐\n\n"
         
         success_image_results = [r for r in image_results if r['success']]
         success_html_results = {r['design_name']: r for r in html_results if r['success']}
@@ -3673,10 +4240,28 @@ async def lanhu_get_ai_analyze_design_result(
 
             html_r = success_html_results.get(img_r['design_name'])
             if html_r:
-                summary_text += f"   📄 完整代码:\n"
+                summary_text += f"   📄 完整代码（图片已替换为本地路径）:\n"
                 summary_text += f"   ```html\n"
                 summary_text += html_r['html_code']
                 summary_text += f"\n   ```\n"
+
+                mapping = html_r.get('image_url_mapping', {})
+                if mapping:
+                    summary_text += f"\n   📥 图片资源下载映射（共 {len(mapping)} 个，必须全部下载到项目本地）:\n"
+                    summary_text += f"   代码中已使用本地路径引用，请按以下映射下载对应远程资源：\n"
+                    for local_path, remote_url in mapping.items():
+                        summary_text += f"     {local_path} ← {remote_url}\n"
+                    summary_text += f"   下载命令示例（macOS/Linux）:\n"
+                    summary_text += f"     mkdir -p ./assets/slices\n"
+                    for local_path, remote_url in mapping.items():
+                        summary_text += f'     curl -o "{local_path}" "{remote_url}"\n'
+                    summary_text += f"\n"
+
+                if html_r.get('design_tokens'):
+                    summary_text += f"\n   --- Design Tokens (高风险元素，权威参考) ---\n"
+                    summary_text += f"   以下参数来自原始设计数据，如 HTML+CSS 与此处冲突，以此处为准。\n\n"
+                    summary_text += html_r['design_tokens']
+                    summary_text += f"\n   --- End Design Tokens ---\n"
 
         # Show failed items
         failed_image_results = [r for r in image_results if not r['success']]
